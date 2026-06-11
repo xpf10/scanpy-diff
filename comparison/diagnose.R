@@ -1,0 +1,8 @@
+suppressPackageStartupMessages(library(Seurat))
+pbmc <- readRDS("comparison/results_seurat/pbmc3k_seurat.rds")
+cat("=== Seurat ===\n")
+cat("Total cells:", ncol(pbmc), "\n")
+cat("Clusters:\n")
+print(table(pbmc$seurat_clusters))
+cat("\nHead barcodes:\n")
+cat(head(colnames(pbmc), 5), sep="\n")
