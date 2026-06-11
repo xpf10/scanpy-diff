@@ -6,13 +6,14 @@ All functions return matplotlib Axes objects for further customization.
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 from anndata import AnnData
+
+from ._utils import markers_to_dict, top_markers
 
 try:
     import seaborn as sns
@@ -290,8 +291,6 @@ def marker_heatmap(
     """
     import scanpy as sc
 
-    from ._utils import top_markers
-
     top = top_markers(all_markers, n=n_genes)
     genes = top["gene"].tolist()
 
@@ -364,8 +363,6 @@ def dotplot(
     """
     import scanpy as sc
 
-    from ._utils import markers_to_dict
-
     marker_dict = markers_to_dict(all_markers, n=n_genes)
 
     ax = sc.pl.dotplot(
@@ -425,12 +422,15 @@ def violin(
     if isinstance(genes, str):
         genes = [genes]
 
+    # If figsize given, set figure size before calling scanpy
+    if figsize is not None:
+        plt.figure(figsize=figsize)
+
     ax = sc.pl.violin(
         adata,
         keys=genes,
         groupby=groupby,
         layer=layer,
-        figsize=figsize,
         show=False,
         save=False,
     )
@@ -544,8 +544,6 @@ def log2fc_heatmap(
     -------
     plt.Axes
     """
-    from ._utils import top_markers
-
     top = top_markers(all_markers, n=n_genes)
     clusters = sorted(all_markers["cluster"].unique().tolist())
     genes_ordered = top["gene"].tolist()

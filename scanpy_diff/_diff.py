@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
+from typing import List, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -143,7 +143,7 @@ def find_markers(
         Multiple testing correction method. One of 'fdr_bh' (Benjamini-
         Hochberg, default), 'bonferroni', 'fdr_by', 'holm'.
     tie_correct : bool
-        Not used (kept for API compatibility).
+        Whether to apply tie correction for the Wilcoxon test.
     use_raw : bool
         If True, use ``adata.raw`` for expression values.
     verbose : bool
@@ -187,6 +187,14 @@ def find_markers(
     # 1. Input validation
     # ------------------------------------------------------------------
     group_str = _validate_group(adata, groupby, group)
+
+    if not tie_correct:
+        warnings.warn(
+            "tie_correct=False is not yet implemented and has no effect. "
+            "The parameter is reserved for future use.",
+            FutureWarning,
+            stacklevel=2,
+        )
 
     if use_raw and adata.raw is None:
         warnings.warn(

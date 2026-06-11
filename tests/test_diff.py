@@ -2,8 +2,11 @@
 Tests for the core differential expression functions.
 """
 
-import warnings
 
+import matplotlib
+
+matplotlib.use("Agg")  # non-interactive backend for headless testing
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
@@ -11,7 +14,6 @@ from anndata import AnnData
 
 import scanpy_diff as sd
 from scanpy_diff._diff import find_all_markers, find_markers
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -457,6 +459,43 @@ class TestUtils:
             assert isinstance(v, list)
             assert len(v) <= 5
 
+    def test_rank_markers_combined(self, simple_adata):
+        """rank_markers with by='combined' should sort by composite score."""
+        markers = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            verbose=False,
+        )
+        ranked = sd.rank_markers(markers, by="combined")
+        # Combined score column should not leak into result
+        assert "_rank_score" not in ranked.columns
+        assert len(ranked) == len(markers)
+
+    def test_store_in_adata_all_markers(self, multi_group_adata):
+        """store_in_adata should store find_all_markers result in adata.uns."""
+        all_markers = find_all_markers(
+            multi_group_adata,
+            groupby="leiden",
+            verbose=False,
+        )
+        sd.store_in_adata(multi_group_adata, all_markers, groupby="leiden")
+        assert "diff_markers" in multi_group_adata.uns
+        stored = multi_group_adata.uns["diff_markers"]
+        assert "markers" in stored
+        assert stored["groupby"] == "leiden"
+
+    def test_store_in_adata_single_group(self, simple_adata):
+        """store_in_adata should work with single-group find_markers result."""
+        markers = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            verbose=False,
+        )
+        sd.store_in_adata(simple_adata, markers, groupby="cluster", key="my_markers")
+        assert "my_markers" in simple_adata.uns
+
 
 # ---------------------------------------------------------------------------
 # Tests for statistical functions
@@ -470,7 +509,6 @@ class TestStatFunctions:
         """Set up test data."""
         np.random.seed(0)
         n = 50
-        n_genes = 10
         # Group with high expression for first 5 genes
         self.X_group = np.hstack([
             np.random.lognormal(3, 0.5, (n, 5)),
@@ -538,3 +576,170 @@ class TestStatFunctions:
         scores, pvals = roc_test(self.X_group, self.X_rest)
         assert np.all((scores >= 0) & (scores <= 1)), \
             f"AUC scores out of range: {scores}"
+
+    def test_deseq2_available(self):
+        """deseq2_test should work if pydeseq2 is installed."""
+        pytest.importorskip("pydeseq2")
+        from scanpy_diff._stats import deseq2_test
+        # Use raw-like counts (positive integers)
+        X_group = (np.exp(self.X_group[:, :5]) - 1).astype(int) + 1
+        X_rest = (np.exp(self.X_rest[:, :5]) - 1).astype(int) + 1
+        scores, pvals = deseq2_test(X_group, X_rest)
+        assert scores.shape == (5,)
+        assert pvals.shape == (5,)
+        assert np.all(pvals >= 0) & np.all(pvals <= 1)
+
+
+# ---------------------------------------------------------------------------
+# Tests for visualization functions (smoke tests)
+# ---------------------------------------------------------------------------
+
+
+class TestVisualization:
+    """Smoke tests for plot functions."""
+
+    @pytest.fixture
+    def markers(self, simple_adata):
+        return find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            verbose=False,
+        )
+
+    @pytest.fixture
+    def all_markers(self, multi_group_adata):
+        return find_all_markers(
+            multi_group_adata,
+            groupby="leiden",
+            verbose=False,
+        )
+
+    def test_volcano(self, markers):
+        """volcano() should return an Axes."""
+        ax = sd.pl.volcano(markers, show=False)
+        assert isinstance(ax, plt.Axes)
+        plt.close(ax.figure)
+
+    def test_volcano_with_save(self, markers, tmp_path):
+        """volcano() should save to file when save is given."""
+        path = tmp_path / "volcano.png"
+        ax = sd.pl.volcano(markers, show=False, save=str(path))
+        assert path.exists()
+        plt.close(ax.figure)
+
+    def test_marker_heatmap(self, multi_group_adata, all_markers):
+        """marker_heatmap() should return a dict of Axes (delegates to sc.pl.heatmap)."""
+        result = sd.pl.marker_heatmap(
+            multi_group_adata, all_markers, groupby="leiden", n_genes=3, show=False
+        )
+        # sc.pl.heatmap returns a dict of Axes
+        assert isinstance(result, dict)
+        assert "heatmap_ax" in result
+        plt.close("all")
+
+    def test_dotplot(self, multi_group_adata, all_markers):
+        """dotplot() should return a dict of Axes (delegates to sc.pl.dotplot)."""
+        result = sd.pl.dotplot(
+            multi_group_adata, all_markers, groupby="leiden", n_genes=3, show=False
+        )
+        # sc.pl.dotplot returns a dict of Axes
+        assert isinstance(result, dict)
+        assert "mainplot_ax" in result
+        plt.close("all")
+
+    def test_violin_single_gene(self, multi_group_adata):
+        """violin() should work with a single gene string."""
+        ax = sd.pl.violin(multi_group_adata, "gene_0", groupby="leiden", show=False)
+        assert isinstance(ax, plt.Axes)
+        plt.close("all")
+
+    def test_violin_gene_list(self, multi_group_adata):
+        """violin() should work with a list of genes (returns list of Axes)."""
+        result = sd.pl.violin(
+            multi_group_adata, ["gene_0", "gene_1"], groupby="leiden", show=False
+        )
+        # sc.pl.violin returns a list of Axes when given multiple genes
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert isinstance(result[0], plt.Axes)
+        plt.close("all")
+
+    def test_summary_barplot(self, all_markers):
+        """summary_barplot() should return an Axes."""
+        ax = sd.pl.summary_barplot(all_markers, show=False)
+        assert isinstance(ax, plt.Axes)
+        plt.close(ax.figure)
+
+    def test_log2fc_heatmap(self, all_markers):
+        """log2fc_heatmap() should return an Axes."""
+        ax = sd.pl.log2fc_heatmap(all_markers, n_genes=3, show=False)
+        assert isinstance(ax, plt.Axes)
+        plt.close(ax.figure)
+
+
+# ---------------------------------------------------------------------------
+# Edge-case tests for find_markers
+# ---------------------------------------------------------------------------
+
+
+class TestFindMarkersEdgeCases:
+    """Tests for edge cases in find_markers()."""
+
+    def test_use_raw_fallback(self, simple_adata):
+        """use_raw=True should warn and fall back when adata.raw is None."""
+        with pytest.warns(UserWarning, match="use_raw=True but adata.raw is None"):
+            find_markers(
+                simple_adata,
+                groupby="cluster",
+                group="0",
+                use_raw=True,
+                verbose=False,
+            )
+
+    def test_empty_result_warns(self, simple_adata):
+        """Should warn when no genes pass pre-filtering."""
+        with pytest.warns(UserWarning, match="No genes passed pre-filtering"):
+            result = find_markers(
+                simple_adata,
+                groupby="cluster",
+                group="0",
+                logfc_threshold=100.0,  # impossibly high
+                verbose=False,
+            )
+        assert len(result) == 0
+
+    def test_group_label_in_categories_but_no_matching_cells(self, simple_adata):
+        """Should raise ValueError when group label is in categories but no cells match.
+
+        Uses a Categorical with an unused category to exercise the defensive
+        n_cells_group == 0 check in find_markers().
+        """
+        # Create an AnnData where the obs column is categorical and includes
+        # an unused category. _validate_group sees the category via .unique(),
+        # but the mask has zero cells.
+        adata = AnnData(
+            X=np.ones((10, 3)),
+            obs=pd.DataFrame({
+                "cluster": pd.Categorical(["0"] * 10, categories=["0", "1"])
+            }, index=[f"cell_{i}" for i in range(10)]),
+            var=pd.DataFrame(index=["g1", "g2", "g3"]),
+        )
+        with pytest.raises(ValueError, match="not found"):
+            find_markers(
+                adata,
+                groupby="cluster",
+                group="1",
+                verbose=False,
+            )
+
+    def test_tie_correct_warns(self, simple_adata):
+        """tie_correct=False should emit FutureWarning."""
+        with pytest.warns(FutureWarning, match="tie_correct"):
+            find_markers(
+                simple_adata,
+                groupby="cluster",
+                group="0",
+                tie_correct=False,
+                verbose=False,
+            )

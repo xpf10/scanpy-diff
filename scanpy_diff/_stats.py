@@ -12,14 +12,12 @@ And returns:
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy import sparse, stats
 from scipy.special import xlogy
-
 
 # ---------------------------------------------------------------------------
 # Wilcoxon rank-sum test (default, equivalent to Seurat's "wilcox")
@@ -72,7 +70,7 @@ def wilcoxon_test(
             stat, pval = stats.mannwhitneyu(g, r, alternative="two-sided")
             scores[i] = stat / (n1 * n2)  # Normalize to [0,1] (AUC)
             pvals[i] = pval
-        except Exception:
+        except (ValueError, RuntimeError):
             pvals[i] = 1.0
             scores[i] = 0.5
 
@@ -196,7 +194,7 @@ def logistic_regression_test(
             lr_stat = 2 * (ll_full - ll_null)
             scores[i] = lr_stat
             pvals[i] = stats.chi2.sf(lr_stat, df=1)
-        except Exception:
+        except (ValueError, np.linalg.LinAlgError, RuntimeError):
             scores[i] = 0.0
             pvals[i] = 1.0
 
@@ -325,7 +323,7 @@ def roc_test(
                 X_group[:, i], X_rest[:, i], alternative="two-sided"
             )
             pvals[i] = pval
-        except Exception:
+        except (ValueError, RuntimeError):
             scores[i] = 0.5
             pvals[i] = 1.0
 

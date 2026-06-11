@@ -1,6 +1,8 @@
 # scanpy-diff
 
-**scanpy-diff** 是一个 scanpy 插件，提供类似 Seurat `FindMarkers`/`FindAllMarkers` 的差异基因表达分析功能。
+**scanpy-diff** is a scanpy plugin providing Seurat-style differential gene expression analysis (`FindMarkers` / `FindAllMarkers`). Supports Wilcoxon, t-test, logistic regression, ROC, and DESeq2 methods with multiple testing correction and visualization.
+
+> 中文用户请参考下方完整文档。English API docs are in the Python docstrings.
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -36,7 +38,7 @@ pip install scanpy-diff
 或从源码安装：
 
 ```bash
-git clone https://github.com/your-org/scanpy-diff.git
+git clone https://github.com/xpf10/scanpy-diff.git
 cd scanpy-diff
 pip install -e ".[dev]"
 ```
@@ -285,6 +287,21 @@ scanpy_diff/
 
 - Seurat: Hao et al. (2021) *Cell* 
 - scanpy: Wolf et al. (2018) *Genome Biology*
+
+---
+
+## 🔍 与 Seurat 的对比验证
+
+项目包含完整的交叉验证脚本（`comparison/` 目录）：
+
+| 脚本 | 说明 |
+|------|------|
+| `seurat_de.R` | Seurat PBMC3k 完整分析流程 |
+| `compare_de.py` | scanpy vs scanpy-diff 全方法对比 |
+| `cross_compare.R` | Seurat vs scanpy-diff 跨平台比较 |
+| `fair_compare.R` | 使用相同 Leiden 标签的公平对比 |
+
+运行顺序：`seurat_de.R` → `compare_de.py` → `cross_compare.R` → `fair_compare.R`
 
 ---
 

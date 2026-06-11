@@ -23,7 +23,13 @@ Usage
 
 from . import pl
 from ._diff import find_all_markers, find_markers
-from ._utils import filter_markers, markers_to_dict, rank_markers, top_markers
+from ._utils import (
+    filter_markers,
+    markers_to_dict,
+    rank_markers,
+    store_in_adata,
+    top_markers,
+)
 
 __version__ = "0.1.0"
 
@@ -34,5 +40,6 @@ __all__ = [
     "rank_markers",
     "top_markers",
     "markers_to_dict",
+    "store_in_adata",
     "pl",
 ]

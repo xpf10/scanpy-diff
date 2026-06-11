@@ -9,6 +9,7 @@ description = "A scanpy plugin for differential gene expression analysis, simila
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "scanpy-diff contributors" }]
+urls = { repository = "https://github.com/xpf10/scanpy-diff" }
 keywords = [
     "bioinformatics",
     "single-cell",
@@ -25,6 +26,8 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 requires-python = ">=3.9"
