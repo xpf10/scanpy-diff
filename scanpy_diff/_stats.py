@@ -27,6 +27,7 @@ from scipy.special import xlogy
 def wilcoxon_test(
     X_group: np.ndarray,
     X_rest: np.ndarray,
+    verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Wilcoxon rank-sum (Mann-Whitney U) test for each gene.
@@ -41,6 +42,8 @@ def wilcoxon_test(
         Expression matrix for the group of interest (n_cells_group x n_genes).
     X_rest : np.ndarray
         Expression matrix for the reference group (n_cells_rest x n_genes).
+    verbose : bool
+        Print progress every 10% of genes.
 
     Returns
     -------
@@ -55,6 +58,9 @@ def wilcoxon_test(
 
     n1 = X_group.shape[0]
     n2 = X_rest.shape[0]
+
+    # Progress report interval: every 10% or every 500 genes, whichever is smaller
+    report_step = max(1, min(n_genes // 10, 500))
 
     for i in range(n_genes):
         g = X_group[:, i]
@@ -73,6 +79,10 @@ def wilcoxon_test(
         except (ValueError, RuntimeError):
             pvals[i] = 1.0
             scores[i] = 0.5
+
+        if verbose and (i + 1) % report_step == 0:
+            pct = (i + 1) / n_genes * 100
+            print(f"  [wilcoxon] {i+1}/{n_genes} genes ({pct:.0f}%)")
 
     return scores, pvals
 
@@ -137,6 +147,7 @@ def logistic_regression_test(
     X_group: np.ndarray,
     X_rest: np.ndarray,
     max_iter: int = 1000,
+    verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Logistic regression likelihood-ratio test for each gene.
@@ -153,6 +164,8 @@ def logistic_regression_test(
         Expression matrix for the reference group.
     max_iter : int
         Maximum iterations for logistic regression solver.
+    verbose : bool
+        Print progress every 10% of genes.
 
     Returns
     -------
@@ -183,6 +196,8 @@ def logistic_regression_test(
         random_state=0,
     )
 
+    report_step = max(1, min(n_genes // 10, 500))
+
     for i in range(n_genes):
         xi = X[:, i : i + 1]
         try:
@@ -197,6 +212,10 @@ def logistic_regression_test(
         except (ValueError, np.linalg.LinAlgError, RuntimeError):
             scores[i] = 0.0
             pvals[i] = 1.0
+
+        if verbose and (i + 1) % report_step == 0:
+            pct = (i + 1) / n_genes * 100
+            print(f"  [logreg] {i+1}/{n_genes} genes ({pct:.0f}%)")
 
     return scores, pvals
 
@@ -278,6 +297,7 @@ def deseq2_test(
 def roc_test(
     X_group: np.ndarray,
     X_rest: np.ndarray,
+    verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     ROC AUC analysis for each gene.
@@ -291,6 +311,8 @@ def roc_test(
         Expression matrix for the group of interest.
     X_rest : np.ndarray
         Expression matrix for the reference group.
+    verbose : bool
+        Print progress every 10% of genes.
 
     Returns
     -------
@@ -310,6 +332,8 @@ def roc_test(
     y = np.array([1] * n1 + [0] * n2)
     X = np.vstack([X_group, X_rest])
 
+    report_step = max(1, min(n_genes // 10, 500))
+
     for i in range(n_genes):
         xi = X[:, i]
         if np.all(xi == xi[0]):
@@ -326,6 +350,10 @@ def roc_test(
         except (ValueError, RuntimeError):
             scores[i] = 0.5
             pvals[i] = 1.0
+
+        if verbose and (i + 1) % report_step == 0:
+            pct = (i + 1) / n_genes * 100
+            print(f"  [roc] {i+1}/{n_genes} genes ({pct:.0f}%)")
 
     return scores, pvals
 

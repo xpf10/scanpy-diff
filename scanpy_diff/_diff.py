@@ -8,6 +8,7 @@ user-facing API, mirroring Seurat's FindMarkers() and FindAllMarkers().
 from __future__ import annotations
 
 import logging
+import time
 import warnings
 from typing import List, Literal, Optional, Union
 
@@ -237,6 +238,8 @@ def find_markers(
             f"'{ref_name}' (n={n_cells_ref}) | method={method}"
         )
 
+    t_start = time.perf_counter()
+
     # ------------------------------------------------------------------
     # 3. Get expression matrices
     # ------------------------------------------------------------------
@@ -262,22 +265,37 @@ def find_markers(
     log2fc_all = compute_log2fc(X_group, X_rest)
 
     # Gene filter mask
+    n_before = n_total_genes
     gene_mask = np.ones(n_total_genes, dtype=bool)
 
     if min_pct > 0:
         gene_mask &= (pct1 >= min_pct) | (pct2 >= min_pct)
+    n_after_pct = gene_mask.sum()
 
     if min_pct_reference > 0:
         gene_mask &= pct2 >= min_pct_reference
+    n_after_ref_pct = gene_mask.sum()
 
     if logfc_threshold > 0:
         gene_mask &= np.abs(log2fc_all) >= logfc_threshold
-
     n_tested = gene_mask.sum()
+
     if verbose:
+        excluded_pct = n_before - n_after_pct
+        excluded_ref = n_after_pct - n_after_ref_pct
+        excluded_lfc = n_after_ref_pct - n_tested
+        parts = []
+        if excluded_pct:
+            parts.append(f"{excluded_pct} by min_pct<{min_pct}")
+        if excluded_ref:
+            parts.append(f"{excluded_ref} by min_pct_reference<{min_pct_reference}")
+        if excluded_lfc:
+            parts.append(f"{excluded_lfc} by |log2fc|<{logfc_threshold}")
+        if parts:
+            print(f"[scanpy_diff] Pre-filter: excluded {', '.join(parts)}")
         print(
-            f"[scanpy_diff] Testing {n_tested}/{n_total_genes} genes "
-            f"(after pct/logFC pre-filtering)"
+            f"[scanpy_diff] Testing {n_tested}/{n_before} genes "
+            f"(after pre-filtering)"
         )
 
     if n_tested == 0:
@@ -298,17 +316,22 @@ def find_markers(
     # ------------------------------------------------------------------
     # 5. Run statistical test
     # ------------------------------------------------------------------
+    if verbose:
+        print(f"[scanpy_diff] Running {method} on {n_tested} genes ...")
+
     if method == "wilcoxon":
-        scores, pvals = wilcoxon_test(X_group_sub, X_rest_sub)
+        scores, pvals = wilcoxon_test(X_group_sub, X_rest_sub, verbose=verbose)
     elif method == "t-test":
         scores, pvals = ttest(X_group_sub, X_rest_sub)
     elif method == "logreg":
-        scores, pvals = logistic_regression_test(X_group_sub, X_rest_sub)
+        scores, pvals = logistic_regression_test(X_group_sub, X_rest_sub, verbose=verbose)
     elif method == "roc":
-        scores, pvals = roc_test(X_group_sub, X_rest_sub)
+        scores, pvals = roc_test(X_group_sub, X_rest_sub, verbose=verbose)
     elif method == "deseq2":
         from ._stats import deseq2_test
 
+        if verbose:
+            print("  [deseq2] fitting pseudo-bulk model ...")
         scores, pvals = deseq2_test(X_group_sub, X_rest_sub)
     else:
         raise ValueError(
@@ -363,7 +386,11 @@ def find_markers(
     result.attrs["n_cells_reference"] = int(n_cells_ref)
 
     if verbose:
-        print(f"[scanpy_diff] Found {len(result)} significant markers.")
+        elapsed = time.perf_counter() - t_start
+        print(
+            f"[scanpy_diff] Found {len(result)} significant markers "
+            f"({elapsed:.1f}s)"
+        )
 
     return result
 
@@ -467,6 +494,8 @@ def find_all_markers(
     else:
         test_groups = all_groups
 
+    t_start_all = time.perf_counter()
+
     if verbose:
         print(
             f"[scanpy_diff] Running find_all_markers for {len(test_groups)} groups "
@@ -476,6 +505,8 @@ def find_all_markers(
     results_list = []
 
     for i, grp in enumerate(test_groups):
+        t_group = time.perf_counter()
+
         if verbose:
             print(
                 f"[scanpy_diff] [{i+1}/{len(test_groups)}] Testing group '{grp}' ..."
@@ -510,9 +541,13 @@ def find_all_markers(
             results_list.append(df)
 
             if verbose:
-                print(f"  → {len(df)} markers found.")
+                elapsed = time.perf_counter() - t_group
+                print(f"  → {len(df)} markers found ({elapsed:.1f}s)")
 
         except Exception as e:
+            if verbose:
+                elapsed = time.perf_counter() - t_group
+                print(f"  → error after {elapsed:.1f}s: {e}")
             warnings.warn(
                 f"Error testing group '{grp}': {e}. Skipping.",
                 UserWarning,
@@ -539,8 +574,10 @@ def find_all_markers(
     if verbose:
         total = len(result)
         n_groups = result["cluster"].nunique()
+        elapsed = time.perf_counter() - t_start_all
         print(
-            f"[scanpy_diff] Done. Found {total} markers across {n_groups} groups."
+            f"[scanpy_diff] Done. Found {total} markers across {n_groups} groups "
+            f"({elapsed:.1f}s total)"
         )
 
     return result
