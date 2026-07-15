@@ -39,6 +39,8 @@ Thumbs.db
 # Large data / results directories
 data/
 results/
+comparison/results_compare/
+comparison/results_seurat/
 
 # Large binary & raw data files (in any directory)
 *.h5ad

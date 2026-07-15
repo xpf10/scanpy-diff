@@ -18,8 +18,8 @@ from anndata import AnnData
 from scipy import sparse
 
 from ._stats import (
+    _to_linear_scale,
     adjust_pvalues,
-    compute_log2fc,
     compute_pct,
     logistic_regression_test,
     roc_test,
@@ -36,8 +36,8 @@ TestMethod = Literal["wilcoxon", "t-test", "logreg", "roc", "deseq2"]
 def _get_expression_matrix(
     adata: AnnData,
     layer: Optional[str] = None,
-) -> np.ndarray:
-    """Extract the expression matrix, ensuring it is dense."""
+) -> Union[np.ndarray, sparse.spmatrix]:
+    """Extract the expression matrix, keeping it sparse if it is sparse."""
     if layer is not None:
         if layer not in adata.layers:
             raise ValueError(
@@ -47,10 +47,7 @@ def _get_expression_matrix(
     else:
         X = adata.X
 
-    if sparse.issparse(X):
-        X = X.toarray()
-
-    return np.asarray(X, dtype=np.float64)
+    return X
 
 
 def _validate_group(
@@ -82,6 +79,8 @@ def find_markers(
     reference: Union[str, int, Literal["rest"]] = "rest",
     method: TestMethod = "wilcoxon",
     layer: Optional[str] = None,
+    replicate_col: Optional[str] = None,
+    covariates: Optional[List[str]] = None,
     n_genes: Optional[int] = None,
     min_pct: float = 0.1,
     min_pct_reference: float = 0.0,
@@ -90,9 +89,13 @@ def find_markers(
     padj_cutoff: float = 1.0,
     only_positive: bool = False,
     correction_method: Literal["fdr_bh", "bonferroni", "fdr_by", "holm"] = "fdr_bh",
+    correction_scope: Literal["tested", "all_genes"] = "all_genes",
+    expression_scale: Literal["log", "raw", "linear"] = "log",
+    log_base: Optional[float] = None,
     tie_correct: bool = True,
     use_raw: bool = False,
     verbose: bool = True,
+    _precomputed_stats: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Find markers for a group vs. a reference group.
@@ -100,89 +103,6 @@ def find_markers(
     This is the primary differential expression function, analogous to
     Seurat's ``FindMarkers()``. It compares expression in ``group`` against
     ``reference`` (or all other cells if ``reference='rest'``).
-
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix.
-    groupby : str
-        Column in ``adata.obs`` containing cell group labels.
-    group : str or int
-        The group (cluster) to find markers for.
-    reference : str, int, or 'rest'
-        Reference group to compare against. Use ``'rest'`` (default) to
-        compare against all other cells.
-    method : {'wilcoxon', 't-test', 'logreg', 'roc', 'deseq2'}
-        Statistical test to use:
-
-        - ``'wilcoxon'`` : Wilcoxon rank-sum test (default, most robust).
-        - ``'t-test'``   : Welch's t-test (faster, assumes normality).
-        - ``'logreg'``   : Logistic regression likelihood-ratio test.
-        - ``'roc'``      : ROC AUC analysis.
-        - ``'deseq2'``   : DESeq2 negative binomial (requires pydeseq2,
-                           use with raw counts).
-    layer : str, optional
-        Layer to use for expression values. Defaults to ``adata.X``.
-    n_genes : int, optional
-        Maximum number of top genes to return. Returns all if None.
-    min_pct : float
-        Minimum fraction of cells in ``group`` that must express a gene
-        for it to be tested. Genes with pct.1 < min_pct are skipped.
-    min_pct_reference : float
-        Minimum fraction of cells in reference that must express a gene.
-        Genes with pct.2 < min_pct_reference are skipped.
-    logfc_threshold : float
-        Minimum absolute log2 fold change threshold. Genes below this
-        threshold are not tested (pre-filter for speed).
-    pval_cutoff : float
-        Filter result to genes with raw p-value <= pval_cutoff.
-    padj_cutoff : float
-        Filter result to genes with adjusted p-value <= padj_cutoff.
-    only_positive : bool
-        If True, only return upregulated markers (log2FC > 0).
-    correction_method : str
-        Multiple testing correction method. One of 'fdr_bh' (Benjamini-
-        Hochberg, default), 'bonferroni', 'fdr_by', 'holm'.
-    tie_correct : bool
-        Whether to apply tie correction for the Wilcoxon test.
-    use_raw : bool
-        If True, use ``adata.raw`` for expression values.
-    verbose : bool
-        Print progress messages.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with the following columns:
-
-        - ``gene``        : Gene name.
-        - ``scores``      : Test statistic or AUC.
-        - ``log2fc``      : Average log2 fold change.
-        - ``pct_1``       : Fraction of cells expressing gene in group.
-        - ``pct_2``       : Fraction of cells expressing gene in reference.
-        - ``pval``        : Raw p-value.
-        - ``padj``        : Adjusted p-value.
-
-        Sorted by ``log2fc`` (descending) then ``padj`` (ascending).
-
-    Examples
-    --------
-    >>> import scanpy as sc
-    >>> import scanpy_diff as sd
-    >>> adata = sc.datasets.pbmc3k_processed()
-    >>> markers = sd.find_markers(adata, groupby='louvain', group='0')
-    >>> markers.head(10)
-
-    >>> # Compare cluster 0 vs cluster 1
-    >>> markers = sd.find_markers(
-    ...     adata, groupby='louvain', group='0', reference='1'
-    ... )
-
-    >>> # Use t-test with stricter thresholds
-    >>> markers = sd.find_markers(
-    ...     adata, groupby='louvain', group='0',
-    ...     method='t-test', min_pct=0.25, logfc_threshold=0.5
-    ... )
     """
     # ------------------------------------------------------------------
     # 1. Input validation
@@ -243,14 +163,14 @@ def find_markers(
     # ------------------------------------------------------------------
     # 3. Get expression matrices
     # ------------------------------------------------------------------
-    if use_raw:
-        adata_sub = adata.raw.to_adata()
-        X_full = _get_expression_matrix(adata_sub, layer=None)
+    if _precomputed_stats is not None:
+        X_full = _precomputed_stats["X_full"]
     else:
-        X_full = _get_expression_matrix(adata, layer=layer)
-
-    X_group = X_full[mask_group, :]
-    X_rest = X_full[mask_ref, :]
+        if use_raw:
+            adata_sub = adata.raw.to_adata()
+            X_full = _get_expression_matrix(adata_sub, layer=None)
+        else:
+            X_full = _get_expression_matrix(adata, layer=layer)
 
     gene_names = (
         adata.raw.var_names.tolist() if use_raw else adata.var_names.tolist()
@@ -260,9 +180,47 @@ def find_markers(
     # ------------------------------------------------------------------
     # 4. Pre-filtering: pct and logFC
     # ------------------------------------------------------------------
-    pct1 = compute_pct(X_group)
-    pct2 = compute_pct(X_rest)
-    log2fc_all = compute_log2fc(X_group, X_rest)
+    if _precomputed_stats is not None:
+        pct1 = _precomputed_stats["pcts"][group_str]
+        all_groups = list(_precomputed_stats["n_cells"].keys())
+
+        if reference == "rest":
+            other_groups = [g for g in all_groups if g != group_str]
+            total_ref_cells = sum(_precomputed_stats["n_cells"][g] for g in other_groups)
+            if total_ref_cells > 0:
+                sum_pct = sum(_precomputed_stats["n_cells"][g] * _precomputed_stats["pcts"][g] for g in other_groups)
+                pct2 = sum_pct / total_ref_cells
+                sum_mean = sum(_precomputed_stats["n_cells"][g] * _precomputed_stats["means"][g] for g in other_groups)
+                mean2 = sum_mean / total_ref_cells
+            else:
+                pct2 = np.zeros(n_total_genes)
+                mean2 = np.zeros(n_total_genes)
+        else:
+            pct2 = _precomputed_stats["pcts"][ref_name]
+            mean2 = _precomputed_stats["means"][ref_name]
+
+        mean1 = _precomputed_stats["means"][group_str]
+        log2fc_all = np.log2(mean1 + 1.0) - np.log2(mean2 + 1.0)
+    else:
+        X_group = X_full[mask_group, :]
+        X_rest = X_full[mask_ref, :]
+
+        pct1 = compute_pct(X_group)
+        pct2 = compute_pct(X_rest)
+
+        X_group_lin = _to_linear_scale(X_group, scale=expression_scale, log_base=log_base)
+        X_rest_lin = _to_linear_scale(X_rest, scale=expression_scale, log_base=log_base)
+        if sparse.issparse(X_group_lin):
+            mean1 = np.asarray(X_group_lin.mean(axis=0)).flatten()
+        else:
+            mean1 = X_group_lin.mean(axis=0)
+
+        if sparse.issparse(X_rest_lin):
+            mean2 = np.asarray(X_rest_lin.mean(axis=0)).flatten()
+        else:
+            mean2 = X_rest_lin.mean(axis=0)
+
+        log2fc_all = np.log2(mean1 + 1.0) - np.log2(mean2 + 1.0)
 
     # Gene filter mask
     n_before = n_total_genes
@@ -310,8 +268,6 @@ def find_markers(
 
     # Subset to tested genes
     gene_indices = np.where(gene_mask)[0]
-    X_group_sub = X_group[:, gene_indices]
-    X_rest_sub = X_rest[:, gene_indices]
 
     # ------------------------------------------------------------------
     # 5. Run statistical test
@@ -319,30 +275,56 @@ def find_markers(
     if verbose:
         print(f"[scanpy_diff] Running {method} on {n_tested} genes ...")
 
-    if method == "wilcoxon":
-        scores, pvals = wilcoxon_test(X_group_sub, X_rest_sub, verbose=verbose)
-    elif method == "t-test":
-        scores, pvals = ttest(X_group_sub, X_rest_sub)
-    elif method == "logreg":
-        scores, pvals = logistic_regression_test(X_group_sub, X_rest_sub, verbose=verbose)
-    elif method == "roc":
-        scores, pvals = roc_test(X_group_sub, X_rest_sub, verbose=verbose)
-    elif method == "deseq2":
+    if method == "deseq2":
         from ._stats import deseq2_test
 
         if verbose:
             print("  [deseq2] fitting pseudo-bulk model ...")
-        scores, pvals = deseq2_test(X_group_sub, X_rest_sub)
-    else:
-        raise ValueError(
-            f"Unknown method '{method}'. "
-            "Choose from: 'wilcoxon', 't-test', 'logreg', 'roc', 'deseq2'."
+
+        if replicate_col is None:
+            raise ValueError(
+                "replicate_col must be provided for DESeq2 to aggregate cells into pseudo-bulk samples."
+            )
+
+        scores, pvals = deseq2_test(
+            X_group_or_adata=adata,
+            groupby=groupby,
+            group=group_str,
+            reference=ref_name,
+            replicate_col=replicate_col,
+            covariates=covariates,
+            layer=layer,
+            use_raw=use_raw,
+            gene_indices=gene_indices,
         )
+    else:
+        X_group_sub = X_full[mask_group, :][:, gene_indices]
+        X_rest_sub = X_full[mask_ref, :][:, gene_indices]
+
+        if method == "wilcoxon":
+            scores, pvals = wilcoxon_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "t-test":
+            scores, pvals = ttest(X_group_sub, X_rest_sub)
+        elif method == "logreg":
+            scores, pvals = logistic_regression_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "roc":
+            scores, pvals = roc_test(X_group_sub, X_rest_sub, verbose=verbose)
+        else:
+            raise ValueError(
+                f"Unknown method '{method}'. "
+                "Choose from: 'wilcoxon', 't-test', 'logreg', 'roc', 'deseq2'."
+            )
 
     # ------------------------------------------------------------------
     # 6. Multiple testing correction
     # ------------------------------------------------------------------
-    padj = adjust_pvalues(pvals, method=correction_method)
+    if correction_scope == "all_genes":
+        full_pvals = np.ones(n_total_genes)
+        full_pvals[gene_indices] = pvals
+        full_padj = adjust_pvalues(full_pvals, method=correction_method)
+        padj = full_padj[gene_indices]
+    else:
+        padj = adjust_pvalues(pvals, method=correction_method)
 
     # ------------------------------------------------------------------
     # 7. Build result DataFrame
@@ -384,6 +366,10 @@ def find_markers(
     result.attrs["method"] = method
     result.attrs["n_cells_group"] = int(n_cells_group)
     result.attrs["n_cells_reference"] = int(n_cells_ref)
+    result.attrs["correction_scope"] = correction_scope
+    result.attrs["min_pct"] = min_pct
+    result.attrs["min_pct_reference"] = min_pct_reference
+    result.attrs["logfc_threshold"] = logfc_threshold
 
     if verbose:
         elapsed = time.perf_counter() - t_start
@@ -401,6 +387,8 @@ def find_all_markers(
     reference: Union[str, int, Literal["rest"]] = "rest",
     method: TestMethod = "wilcoxon",
     layer: Optional[str] = None,
+    replicate_col: Optional[str] = None,
+    covariates: Optional[List[str]] = None,
     n_genes_per_group: Optional[int] = None,
     min_pct: float = 0.1,
     min_pct_reference: float = 0.0,
@@ -409,8 +397,12 @@ def find_all_markers(
     padj_cutoff: float = 0.05,
     only_positive: bool = True,
     correction_method: Literal["fdr_bh", "bonferroni", "fdr_by", "holm"] = "fdr_bh",
+    correction_scope: Literal["tested", "all_genes"] = "all_genes",
+    expression_scale: Literal["log", "raw", "linear"] = "log",
+    log_base: Optional[float] = None,
     use_raw: bool = False,
     groups: Optional[List[Union[str, int]]] = None,
+    ignore_failures: bool = False,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """
@@ -418,60 +410,6 @@ def find_all_markers(
 
     Analogous to Seurat's ``FindAllMarkers()``. Runs ``find_markers()``
     for each group and combines the results.
-
-    Parameters
-    ----------
-    adata : AnnData
-        Annotated data matrix.
-    groupby : str
-        Column in ``adata.obs`` containing cell group labels.
-    reference : str, int, or 'rest'
-        Reference group. Default is ``'rest'`` (all other cells).
-    method : TestMethod
-        Statistical test. See ``find_markers()`` for options.
-    layer : str, optional
-        Expression layer to use. Defaults to ``adata.X``.
-    n_genes_per_group : int, optional
-        Maximum number of top marker genes to return per group.
-    min_pct : float
-        Minimum expression fraction threshold.
-    min_pct_reference : float
-        Minimum expression fraction in reference threshold.
-    logfc_threshold : float
-        Minimum log2 fold change threshold for pre-filtering.
-    pval_cutoff : float
-        Maximum raw p-value cutoff.
-    padj_cutoff : float
-        Maximum adjusted p-value cutoff.
-    only_positive : bool
-        If True (default), only return upregulated markers.
-    correction_method : str
-        Multiple testing correction method.
-    use_raw : bool
-        Use ``adata.raw`` if True.
-    groups : list, optional
-        Subset of groups to test. Defaults to all groups.
-    verbose : bool
-        Print progress.
-
-    Returns
-    -------
-    pd.DataFrame
-        Combined DataFrame with an extra ``'cluster'`` column indicating
-        the source group. Sorted by cluster, then log2fc descending.
-
-    Examples
-    --------
-    >>> import scanpy as sc
-    >>> import scanpy_diff as sd
-    >>> adata = sc.datasets.pbmc3k_processed()
-    >>> all_markers = sd.find_all_markers(adata, groupby='louvain')
-    >>> all_markers.groupby('cluster').head(5)
-
-    >>> # Top 10 markers per cluster
-    >>> all_markers = sd.find_all_markers(
-    ...     adata, groupby='louvain', n_genes_per_group=10
-    ... )
     """
     if groupby not in adata.obs.columns:
         raise ValueError(
@@ -502,7 +440,50 @@ def find_all_markers(
             f"using '{groupby}' | method={method}"
         )
 
+    # ------------------------------------------------------------------
+    # Precompute statistics for all groups if method is NOT deseq2 (as deseq2 needs raw counts and design)
+    # ------------------------------------------------------------------
+    precomputed_stats = None
+    if method != "deseq2":
+        if verbose:
+            print("[scanpy_diff] Precomputing group statistics for acceleration ...")
+        labels = adata.obs[groupby].astype(str).values
+        if use_raw:
+            adata_sub = adata.raw.to_adata()
+            X_full = _get_expression_matrix(adata_sub, layer=None)
+        else:
+            X_full = _get_expression_matrix(adata, layer=layer)
+
+        means = {}
+        pcts = {}
+        n_cells = {}
+
+        for grp in all_groups:
+            mask = labels == grp
+            n_cells[grp] = int(mask.sum())
+            if n_cells[grp] > 0:
+                X_grp = X_full[mask, :]
+                pcts[grp] = compute_pct(X_grp, threshold=0.0)
+
+                X_grp_lin = _to_linear_scale(X_grp, scale=expression_scale, log_base=log_base)
+                if sparse.issparse(X_grp_lin):
+                    means[grp] = np.asarray(X_grp_lin.mean(axis=0)).flatten()
+                else:
+                    means[grp] = X_grp_lin.mean(axis=0)
+            else:
+                n_genes = X_full.shape[1]
+                pcts[grp] = np.zeros(n_genes)
+                means[grp] = np.zeros(n_genes)
+
+        precomputed_stats = {
+            "means": means,
+            "pcts": pcts,
+            "n_cells": n_cells,
+            "X_full": X_full,
+        }
+
     results_list = []
+    failures = {}
 
     for i, grp in enumerate(test_groups):
         t_group = time.perf_counter()
@@ -512,7 +493,6 @@ def find_all_markers(
                 f"[scanpy_diff] [{i+1}/{len(test_groups)}] Testing group '{grp}' ..."
             )
 
-        # Skip if this group IS the reference
         if reference != "rest" and str(reference) == grp:
             if verbose:
                 print(f"  Skipping group '{grp}' (same as reference).")
@@ -526,6 +506,8 @@ def find_all_markers(
                 reference=reference,
                 method=method,
                 layer=layer,
+                replicate_col=replicate_col,
+                covariates=covariates,
                 n_genes=n_genes_per_group,
                 min_pct=min_pct,
                 min_pct_reference=min_pct_reference,
@@ -534,8 +516,12 @@ def find_all_markers(
                 padj_cutoff=padj_cutoff,
                 only_positive=only_positive,
                 correction_method=correction_method,
+                correction_scope=correction_scope,
+                expression_scale=expression_scale,
+                log_base=log_base,
                 use_raw=use_raw,
                 verbose=False,  # Suppress per-group verbosity
+                _precomputed_stats=precomputed_stats,
             )
             df.insert(0, "cluster", grp)
             results_list.append(df)
@@ -545,6 +531,9 @@ def find_all_markers(
                 print(f"  → {len(df)} markers found ({elapsed:.1f}s)")
 
         except Exception as e:
+            if not ignore_failures:
+                raise e
+            failures[grp] = str(e)
             if verbose:
                 elapsed = time.perf_counter() - t_group
                 print(f"  → error after {elapsed:.1f}s: {e}")
@@ -553,6 +542,11 @@ def find_all_markers(
                 UserWarning,
             )
             continue
+
+    if failures:
+        print(f"[scanpy_diff] Warning: differential expression failed for {len(failures)} groups:")
+        for failed_grp, err in failures.items():
+            print(f"  - Group '{failed_grp}': {err}")
 
     if not results_list:
         warnings.warn("No markers found for any group.", UserWarning)

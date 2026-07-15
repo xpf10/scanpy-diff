@@ -73,7 +73,7 @@ def rank_markers(
     markers: pd.DataFrame,
     by: Literal["log2fc", "padj", "pval", "scores", "combined"] = "combined",
     n_top: Optional[int] = None,
-    ascending: bool = False,
+    ascending: Optional[bool] = None,
 ) -> pd.DataFrame:
     """
     Re-rank markers by a given criterion.
@@ -92,8 +92,9 @@ def rank_markers(
         - ``'combined'`` : Combined score = log2fc * -log10(padj + 1e-300).
     n_top : int, optional
         Return only the top N markers.
-    ascending : bool
-        Sort in ascending order. Default is False (best markers first).
+    ascending : bool, optional
+        Sort in ascending order. If None (default), sorts "best markers first"
+        (i.e., ascending for pval/padj, and descending for log2fc/scores/combined).
 
     Returns
     -------
@@ -102,15 +103,18 @@ def rank_markers(
     """
     df = markers.copy()
 
+    if ascending is None:
+        sort_ascending = True if by in ("padj", "pval") else False
+    else:
+        sort_ascending = ascending
+
     if by == "combined":
         df["_rank_score"] = df["log2fc"] * (-np.log10(df["padj"] + 1e-300))
-        df = df.sort_values("_rank_score", ascending=ascending).drop(
+        df = df.sort_values("_rank_score", ascending=sort_ascending).drop(
             columns=["_rank_score"]
         )
-    elif by == "padj":
-        df = df.sort_values("padj", ascending=not ascending)
     else:
-        df = df.sort_values(by, ascending=ascending)
+        df = df.sort_values(by, ascending=sort_ascending)
 
     df = df.reset_index(drop=True)
 

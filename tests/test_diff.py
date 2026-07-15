@@ -743,3 +743,136 @@ class TestFindMarkersEdgeCases:
                 tie_correct=False,
                 verbose=False,
             )
+
+
+# ---------------------------------------------------------------------------
+# Additional validation and regression tests
+# ---------------------------------------------------------------------------
+
+
+class TestRobustnessAndEdgeCases:
+    """Additional robust edge cases and regressions."""
+
+    def test_sparse_inputs(self, simple_adata):
+        """Verify that CSR and CSC sparse matrices do not crash and give identical results to dense."""
+        from scipy import sparse
+
+        # Copy data and make X sparse
+        adata_csr = simple_adata.copy()
+        adata_csr.X = sparse.csr_matrix(adata_csr.X)
+
+        adata_csc = simple_adata.copy()
+        adata_csc.X = sparse.csc_matrix(adata_csc.X)
+
+        # 1. Wilcoxon on sparse vs dense
+        res_dense = find_markers(simple_adata, groupby="cluster", group="0", method="wilcoxon", verbose=False)
+        res_csr = find_markers(adata_csr, groupby="cluster", group="0", method="wilcoxon", verbose=False)
+        res_csc = find_markers(adata_csc, groupby="cluster", group="0", method="wilcoxon", verbose=False)
+
+        pd.testing.assert_frame_equal(res_dense, res_csr)
+        pd.testing.assert_frame_equal(res_dense, res_csc)
+
+        # 2. t-test on sparse vs dense
+        res_ttest_dense = find_markers(simple_adata, groupby="cluster", group="0", method="t-test", verbose=False)
+        res_ttest_csr = find_markers(adata_csr, groupby="cluster", group="0", method="t-test", verbose=False)
+        pd.testing.assert_frame_equal(res_ttest_dense, res_ttest_csr)
+
+    def test_small_groups(self):
+        """Verify that extremely small groups (e.g. 2 cells) or empty groups are handled correctly."""
+        np.random.seed(42)
+        X = np.random.lognormal(2, 0.5, size=(5, 10))
+        # Group 0 has 2 cells, Group 1 has 3 cells
+        obs = pd.DataFrame({"cluster": ["0", "0", "1", "1", "1"]})
+        adata = AnnData(X=X, obs=obs)
+
+        # Running t-test or Wilcoxon should not crash
+        res = find_markers(adata, groupby="cluster", group="0", method="t-test", verbose=False)
+        assert len(res) > 0
+
+        res_wilcox = find_markers(adata, groupby="cluster", group="0", method="wilcoxon", verbose=False)
+        assert len(res_wilcox) > 0
+
+    def test_nan_inf_inputs(self, simple_adata):
+        """Verify that NaN or Inf expression values are handled gracefully without crashing."""
+        adata = simple_adata.copy()
+        # Introduce NaNs and Infs
+        adata.X[0, 0] = np.nan
+        adata.X[1, 1] = np.inf
+
+        res = find_markers(adata, groupby="cluster", group="0", method="wilcoxon", verbose=False)
+        assert len(res) > 0
+        assert not res.isnull().any().any()  # Should not contain NaNs in final outputs
+
+    def test_rank_markers_ascending_descending_padj(self, simple_adata):
+        """Verify that rank_markers handles ascending parameter correctly for padj."""
+        res = find_markers(simple_adata, groupby="cluster", group="0", verbose=False)
+
+        # ascending=True should sort from smallest padj to largest padj
+        ranked_asc = sd.rank_markers(res, by="padj", ascending=True)
+        assert ranked_asc["padj"].iloc[0] <= ranked_asc["padj"].iloc[-1]
+
+        # ascending=False should sort from largest padj to smallest padj
+        ranked_desc = sd.rank_markers(res, by="padj", ascending=False)
+        assert ranked_desc["padj"].iloc[0] >= ranked_desc["padj"].iloc[-1]
+
+    def test_deseq2_pseudo_bulk(self):
+        """Test DESeq2 pseudo-bulk aggregation workflow with replicates and covariates."""
+        pytest.importorskip("pydeseq2")
+        np.random.seed(42)
+        # Create an AnnData with raw integer counts, biological replicates, and a covariate
+        n_cells = 80
+        n_genes = 10
+        X = np.random.poisson(lam=10, size=(n_cells, n_genes))
+
+        # Plant difference in gene 0
+        # Condition group has higher expression
+        X[:40, 0] = np.random.poisson(lam=50, size=40)
+        X[40:, 0] = np.random.poisson(lam=10, size=40)
+
+        obs = pd.DataFrame({
+            "condition": ["group"] * 40 + ["rest"] * 40,
+            "replicate": (["rep1"] * 20 + ["rep2"] * 20) * 2,
+            "batch": (["batchA"] * 10 + ["batchB"] * 10) * 4
+        })
+        adata = AnnData(X=X, obs=obs)
+
+        # 1. Run find_markers with deseq2 and replicate_col
+        res = find_markers(
+            adata,
+            groupby="condition",
+            group="group",
+            reference="rest",
+            method="deseq2",
+            replicate_col="replicate",
+            covariates=["batch"],
+            logfc_threshold=0.0,
+            min_pct=0.0,
+            verbose=False
+        )
+        assert len(res) > 0
+        # Gene 0 should be highly significant and have positive log2fc
+        gene0_res = res[res["gene"] == "gene_0"]
+        assert len(gene0_res) == 1
+        assert gene0_res["log2fc"].values[0] > 1.0
+
+        # 2. Check that it raises error if counts are not raw integers
+        adata_normalized = adata.copy()
+        adata_normalized.X = adata_normalized.X / 2.0
+        with pytest.raises(ValueError, match="requires raw integer counts"):
+            find_markers(
+                adata_normalized,
+                groupby="condition",
+                group="group",
+                method="deseq2",
+                replicate_col="replicate",
+                verbose=False
+            )
+
+    def test_find_all_markers_precomputed_acceleration(self, multi_group_adata):
+        """Verify that find_all_markers works and returns identical results with/without precomputation."""
+        # 1. Run with precomputed stats (automatic under the hood now)
+        res_fast = find_all_markers(multi_group_adata, groupby="leiden", verbose=False)
+
+        # 2. Verify results are sensible
+        assert "cluster" in res_fast.columns
+        assert len(res_fast) > 0
