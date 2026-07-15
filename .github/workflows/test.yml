@@ -10,6 +10,9 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +35,7 @@ jobs:
         run: ruff check scanpy_diff/ tests/ --output-format sarif --output-file ruff-results.sarif || true
 
       - name: Upload Ruff SARIF results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: ruff-results.sarif
           category: ruff
