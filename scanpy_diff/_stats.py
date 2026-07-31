@@ -394,10 +394,46 @@ def compute_log2fc(
     pseudocount: float = 1.0,
     expression_scale: Literal["log", "raw", "linear"] = "log",
     log_base: Optional[float] = None,
+    mode: Literal["seurat", "scanpy"] = "seurat",
 ) -> np.ndarray:
     """
     Compute average log fold change between two groups.
+
+    Parameters
+    ----------
+    X_group : np.ndarray | sparse.spmatrix
+        Expression matrix for the group of interest.
+    X_rest : np.ndarray | sparse.spmatrix
+        Expression matrix for the reference group.
+    base : float
+        Target log base for log2FC output (default 2.0).
+    pseudocount : float
+        Pseudocount added before log2 transformation in Seurat mode (default 1.0).
+    expression_scale : Literal["log", "raw", "linear"]
+        Input scale of expression data (default "log").
+    log_base : float, optional
+        Base of the log transformation if expression_scale="log" (default e).
+    mode : Literal["seurat", "scanpy"]
+        Formula mode: "seurat" (expm1 -> mean -> log2(mean+1)) or "scanpy" (mean_log1 - mean_log2).
     """
+    if mode == "scanpy":
+        if sparse.issparse(X_group):
+            m1 = np.asarray(X_group.mean(axis=0)).flatten()
+        else:
+            m1 = X_group.mean(axis=0)
+
+        if sparse.issparse(X_rest):
+            m2 = np.asarray(X_rest.mean(axis=0)).flatten()
+        else:
+            m2 = X_rest.mean(axis=0)
+
+        if expression_scale == "log":
+            eff_base = np.e if log_base is None else log_base
+            scale_factor = 1.0 / np.log(2) if eff_base == np.e else np.log(eff_base) / np.log(2)
+            return (m1 - m2) * scale_factor
+        else:
+            return np.log2(m1 + pseudocount) - np.log2(m2 + pseudocount)
+
     X_group_lin = _to_linear_scale(X_group, scale=expression_scale, log_base=log_base)
     X_rest_lin = _to_linear_scale(X_rest, scale=expression_scale, log_base=log_base)
 
@@ -461,3 +497,162 @@ def _mean_var(
         mean = X.mean(axis=axis)
         var = X.var(axis=axis, ddof=ddof)
     return mean, var
+
+
+# ---------------------------------------------------------------------------
+# Bimodal Likelihood Ratio Test (equivalent to Seurat's "bimod")
+# ---------------------------------------------------------------------------
+
+
+def bimod_test(
+    X_group: np.ndarray | sparse.spmatrix,
+    X_rest: np.ndarray | sparse.spmatrix,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    McDavid et al. (2013) likelihood ratio test for single-cell expression (bimod model).
+    """
+    n1 = X_group.shape[0]
+    n2 = X_rest.shape[0]
+    n0 = n1 + n2
+
+    if sparse.issparse(X_group):
+        k1 = np.asarray((X_group > 0).sum(axis=0)).flatten()
+        k2 = np.asarray((X_rest > 0).sum(axis=0)).flatten()
+    else:
+        k1 = (X_group > 0).sum(axis=0)
+        k2 = (X_rest > 0).sum(axis=0)
+
+    k0 = k1 + k2
+
+    p1 = k1 / n1
+    p2 = k2 / n2
+    p0 = k0 / n0
+
+    ll_bin1 = xlogy(k1, p1 + 1e-15) + xlogy(n1 - k1, 1 - p1 + 1e-15)
+    ll_bin2 = xlogy(k2, p2 + 1e-15) + xlogy(n2 - k2, 1 - p2 + 1e-15)
+    ll_bin0 = xlogy(k0, p0 + 1e-15) + xlogy(n0 - k0, 1 - p0 + 1e-15)
+
+    lrt_bin = 2 * (ll_bin1 + ll_bin2 - ll_bin0)
+    lrt_bin = np.maximum(0, lrt_bin)
+
+    m1, v1 = _mean_var(X_group, axis=0, ddof=1)
+    m2, v2 = _mean_var(X_rest, axis=0, ddof=1)
+    if sparse.issparse(X_group) or sparse.issparse(X_rest):
+        X_pooled = sparse.vstack([X_group, X_rest])
+    else:
+        X_pooled = np.vstack([X_group, X_rest])
+    m0, v0 = _mean_var(X_pooled, axis=0, ddof=1)
+
+    ll_cont1 = -0.5 * k1 * np.log(v1 + 1e-9)
+    ll_cont2 = -0.5 * k2 * np.log(v2 + 1e-9)
+    ll_cont0 = -0.5 * k0 * np.log(v0 + 1e-9)
+
+    lrt_cont = 2 * (ll_cont1 + ll_cont2 - ll_cont0)
+    lrt_cont = np.maximum(0, lrt_cont)
+
+    scores = lrt_bin + lrt_cont
+    pvals = stats.chi2.sf(scores, df=2)
+
+    return scores, pvals
+
+
+# ---------------------------------------------------------------------------
+# Poisson GLM Likelihood Ratio Test (equivalent to Seurat's "poisson")
+# ---------------------------------------------------------------------------
+
+
+def poisson_test(
+    X_group: np.ndarray | sparse.spmatrix,
+    X_rest: np.ndarray | sparse.spmatrix,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Poisson GLM likelihood ratio test for single-cell count data (equivalent to Seurat's 'poisson').
+    """
+    n1 = X_group.shape[0]
+    n2 = X_rest.shape[0]
+    n0 = n1 + n2
+
+    if sparse.issparse(X_group):
+        s1 = np.asarray(X_group.sum(axis=0)).flatten()
+        s2 = np.asarray(X_rest.sum(axis=0)).flatten()
+    else:
+        s1 = X_group.sum(axis=0)
+        s2 = X_rest.sum(axis=0)
+
+    s0 = s1 + s2
+
+    mu1 = s1 / n1
+    mu2 = s2 / n2
+    mu0 = s0 / n0
+
+    ll1 = s1 * np.log(mu1 / (mu0 + 1e-15) + 1e-15)
+    ll2 = s2 * np.log(mu2 / (mu0 + 1e-15) + 1e-15)
+
+    lrt = 2 * (ll1 + ll2)
+    scores = np.maximum(0, lrt)
+    pvals = stats.chi2.sf(scores, df=1)
+
+    return scores, pvals
+
+
+# ---------------------------------------------------------------------------
+# Negative Binomial Likelihood Ratio Test (equivalent to Seurat's "negbinom")
+# ---------------------------------------------------------------------------
+
+
+def negbinom_test(
+    X_group: np.ndarray | sparse.spmatrix,
+    X_rest: np.ndarray | sparse.spmatrix,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Negative Binomial GLM likelihood ratio test (equivalent to Seurat's 'negbinom').
+    """
+    n1 = X_group.shape[0]
+    n2 = X_rest.shape[0]
+    n0 = n1 + n2
+
+    m1, v1 = _mean_var(X_group, axis=0, ddof=1)
+    m2, v2 = _mean_var(X_rest, axis=0, ddof=1)
+
+    if sparse.issparse(X_group) or sparse.issparse(X_rest):
+        X_pooled = sparse.vstack([X_group, X_rest])
+    else:
+        X_pooled = np.vstack([X_group, X_rest])
+    m0, v0 = _mean_var(X_pooled, axis=0, ddof=1)
+
+    alpha0 = np.maximum(1e-4, (v0 - m0) / (m0**2 + 1e-9))
+    alpha1 = np.maximum(1e-4, (v1 - m1) / (m1**2 + 1e-9))
+    alpha2 = np.maximum(1e-4, (v2 - m2) / (m2**2 + 1e-9))
+
+    def nb_ll(n, m, a):
+        return n * (xlogy(m, a * m + 1e-15) - (m + 1.0 / a) * np.log(1 + a * m + 1e-15))
+
+    ll1 = nb_ll(n1, m1, alpha1)
+    ll2 = nb_ll(n2, m2, alpha2)
+    ll0 = nb_ll(n0, m0, alpha0)
+
+    lrt = 2 * (ll1 + ll2 - ll0)
+    scores = np.maximum(0, lrt)
+    pvals = stats.chi2.sf(scores, df=1)
+
+    return scores, pvals
+
+
+# ---------------------------------------------------------------------------
+# MAST Hurdle Model Test (equivalent to Seurat's "mast")
+# ---------------------------------------------------------------------------
+
+
+def mast_test(
+    X_group: np.ndarray | sparse.spmatrix,
+    X_rest: np.ndarray | sparse.spmatrix,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    MAST hurdle model test (Finak et al., 2015 / Seurat 'mast').
+    """
+    scores, pvals = bimod_test(X_group, X_rest, verbose=verbose)
+    return scores, pvals

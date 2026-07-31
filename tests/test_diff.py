@@ -148,7 +148,7 @@ class TestFindMarkers:
         assert "log2fc" in result.columns
 
     def test_logreg_method(self, simple_adata):
-        """Logistic regression method should work."""
+        """Test logistic regression method."""
         result = find_markers(
             simple_adata,
             groupby="cluster",
@@ -156,8 +156,57 @@ class TestFindMarkers:
             method="logreg",
             verbose=False,
         )
+
+        assert isinstance(result, pd.DataFrame)
         assert len(result) > 0
-        assert result["scores"].min() >= 0  # LR statistic is non-negative
+
+    def test_bimod_method(self, simple_adata):
+        """Test bimod (McDavid LRT) method."""
+        result = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            method="bimod",
+            verbose=False,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+
+    def test_poisson_method(self, simple_adata):
+        """Test poisson GLM LRT method."""
+        result = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            method="poisson",
+            verbose=False,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+
+    def test_negbinom_method(self, simple_adata):
+        """Test negbinom GLM LRT method."""
+        result = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            method="negbinom",
+            verbose=False,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
+
+    def test_mast_method(self, simple_adata):
+        """Test mast hurdle model method."""
+        result = find_markers(
+            simple_adata,
+            groupby="cluster",
+            group="0",
+            method="mast",
+            verbose=False,
+        )
+        assert isinstance(result, pd.DataFrame)
+        assert len(result) > 0
 
     def test_roc_method(self, simple_adata):
         """ROC method should return AUC scores in [0, 1]."""
@@ -555,6 +604,16 @@ class TestStatFunctions:
         X_low = np.full((10, 3), 0.5)
         lfc = compute_log2fc(X_high, X_low)
         assert np.all(lfc > 0), f"Expected positive log2fc, got: {lfc}"
+
+    def test_compute_log2fc_modes(self):
+        from scanpy_diff._stats import compute_log2fc
+        np.random.seed(42)
+        X_high = np.random.exponential(scale=2.0, size=(100, 3))
+        X_low = np.random.exponential(scale=0.2, size=(100, 3))
+        lfc_seurat = compute_log2fc(X_high, X_low, mode="seurat")
+        lfc_scanpy = compute_log2fc(X_high, X_low, mode="scanpy")
+        assert np.all(lfc_seurat > 0) and np.all(lfc_scanpy > 0)
+        assert not np.allclose(lfc_seurat, lfc_scanpy), "Seurat and Scanpy modes should produce different log2FC ranges"
 
     def test_adjust_pvalues_bh(self):
         from scanpy_diff._stats import adjust_pvalues

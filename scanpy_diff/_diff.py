@@ -20,8 +20,13 @@ from scipy import sparse
 from ._stats import (
     _to_linear_scale,
     adjust_pvalues,
+    bimod_test,
+    compute_log2fc,
     compute_pct,
     logistic_regression_test,
+    mast_test,
+    negbinom_test,
+    poisson_test,
     roc_test,
     ttest,
     wilcoxon_test,
@@ -30,7 +35,17 @@ from ._stats import (
 logger = logging.getLogger(__name__)
 
 # Type alias for test methods
-TestMethod = Literal["wilcoxon", "t-test", "logreg", "roc", "deseq2"]
+TestMethod = Literal[
+    "wilcoxon",
+    "t-test",
+    "logreg",
+    "roc",
+    "deseq2",
+    "bimod",
+    "poisson",
+    "negbinom",
+    "mast",
+]
 
 
 def _get_expression_matrix(
@@ -92,6 +107,7 @@ def find_markers(
     correction_scope: Literal["tested", "all_genes"] = "all_genes",
     expression_scale: Literal["log", "raw", "linear"] = "log",
     log_base: Optional[float] = None,
+    log2fc_mode: Literal["seurat", "scanpy"] = "seurat",
     tie_correct: bool = True,
     use_raw: bool = False,
     verbose: bool = True,
@@ -200,7 +216,18 @@ def find_markers(
             mean2 = _precomputed_stats["means"][ref_name]
 
         mean1 = _precomputed_stats["means"][group_str]
-        log2fc_all = np.log2(mean1 + 1.0) - np.log2(mean2 + 1.0)
+        if log2fc_mode == "scanpy":
+            # Compute directly using compute_log2fc
+            X_group = _precomputed_stats["X_full"][mask_group, :]
+            X_rest = _precomputed_stats["X_full"][mask_ref, :]
+            log2fc_all = compute_log2fc(
+                X_group, X_rest,
+                expression_scale=expression_scale,
+                log_base=log_base,
+                mode=log2fc_mode,
+            )
+        else:
+            log2fc_all = np.log2(mean1 + 1.0) - np.log2(mean2 + 1.0)
     else:
         X_group = X_full[mask_group, :]
         X_rest = X_full[mask_ref, :]
@@ -208,19 +235,12 @@ def find_markers(
         pct1 = compute_pct(X_group)
         pct2 = compute_pct(X_rest)
 
-        X_group_lin = _to_linear_scale(X_group, scale=expression_scale, log_base=log_base)
-        X_rest_lin = _to_linear_scale(X_rest, scale=expression_scale, log_base=log_base)
-        if sparse.issparse(X_group_lin):
-            mean1 = np.asarray(X_group_lin.mean(axis=0)).flatten()
-        else:
-            mean1 = X_group_lin.mean(axis=0)
-
-        if sparse.issparse(X_rest_lin):
-            mean2 = np.asarray(X_rest_lin.mean(axis=0)).flatten()
-        else:
-            mean2 = X_rest_lin.mean(axis=0)
-
-        log2fc_all = np.log2(mean1 + 1.0) - np.log2(mean2 + 1.0)
+        log2fc_all = compute_log2fc(
+            X_group, X_rest,
+            expression_scale=expression_scale,
+            log_base=log_base,
+            mode=log2fc_mode,
+        )
 
     # Gene filter mask
     n_before = n_total_genes
@@ -309,10 +329,19 @@ def find_markers(
             scores, pvals = logistic_regression_test(X_group_sub, X_rest_sub, verbose=verbose)
         elif method == "roc":
             scores, pvals = roc_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "bimod":
+            scores, pvals = bimod_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "poisson":
+            scores, pvals = poisson_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "negbinom":
+            scores, pvals = negbinom_test(X_group_sub, X_rest_sub, verbose=verbose)
+        elif method == "mast":
+            scores, pvals = mast_test(X_group_sub, X_rest_sub, verbose=verbose)
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
-                "Choose from: 'wilcoxon', 't-test', 'logreg', 'roc', 'deseq2'."
+                "Choose from: 'wilcoxon', 't-test', 'logreg', 'roc', 'deseq2', "
+                "'bimod', 'poisson', 'negbinom', 'mast'."
             )
 
     # ------------------------------------------------------------------
@@ -400,6 +429,7 @@ def find_all_markers(
     correction_scope: Literal["tested", "all_genes"] = "all_genes",
     expression_scale: Literal["log", "raw", "linear"] = "log",
     log_base: Optional[float] = None,
+    log2fc_mode: Literal["seurat", "scanpy"] = "seurat",
     use_raw: bool = False,
     groups: Optional[List[Union[str, int]]] = None,
     ignore_failures: bool = False,
@@ -519,6 +549,7 @@ def find_all_markers(
                 correction_scope=correction_scope,
                 expression_scale=expression_scale,
                 log_base=log_base,
+                log2fc_mode=log2fc_mode,
                 use_raw=use_raw,
                 verbose=False,  # Suppress per-group verbosity
                 _precomputed_stats=precomputed_stats,
