@@ -46,7 +46,7 @@ pip install -e ".[dev]"
 可选依赖（DESeq2 方法）：
 
 ```bash
-pip install pydeseq2
+pip install scanpy-diff[pydeseq2]
 ```
 
 ---
@@ -207,13 +207,19 @@ markers = sd.find_markers(adata, groupby='leiden', group='0', method='roc')
 ```python
 markers = sd.find_markers(
     adata, groupby='leiden', group='0',
-    method='deseq2', layer='counts'  # 需要原始计数
+    method='deseq2',
+    layer='counts',            # 需要原始整数计数
+    replicate_col='sample_id',  # 必填：用于聚合成伪批量样本
+    covariates=['batch'],       # 可选：加入设计公式的协变量
 )
 ```
 
-- 需要安装 `pydeseq2`：`pip install pydeseq2`
-- 使用原始计数数据（整数）
-- 适合处理批次效应显著的数据
+- 需要安装 `pydeseq2`（>=0.5.0）：`pip install scanpy-diff[pydeseq2]`
+- 细胞按 `(分组, replicate_col, *covariates)` 求和为伪批量样本后再检验。逐细胞拟合会把同一个体的细胞当作独立观测，导致 p 值严重失真
+- 每个分组至少需要 2 个伪批量样本，否则报错
+- 只接受原始整数计数；传入已标准化/对数化的数据会报 `ValueError`
+- `scores` 列为 DESeq2 的 log2 fold change，`log2fc` 列按原始计数尺度计算
+- 适合处理批次效应显著、且有生物学重复标注的数据
 
 ---
 

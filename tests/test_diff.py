@@ -636,17 +636,37 @@ class TestStatFunctions:
         assert np.all((scores >= 0) & (scores <= 1)), \
             f"AUC scores out of range: {scores}"
 
-    def test_deseq2_available(self):
-        """deseq2_test should work if pydeseq2 is installed."""
+    def test_deseq2_pseudo_bulk_signature(self):
+        """deseq2_test aggregates cells into pseudo-bulk samples and honours gene_indices."""
         pytest.importorskip("pydeseq2")
         from scanpy_diff._stats import deseq2_test
-        # Use raw-like counts (positive integers)
-        X_group = (np.exp(self.X_group[:, :5]) - 1).astype(int) + 1
-        X_rest = (np.exp(self.X_rest[:, :5]) - 1).astype(int) + 1
-        scores, pvals = deseq2_test(X_group, X_rest)
-        assert scores.shape == (5,)
-        assert pvals.shape == (5,)
-        assert np.all(pvals >= 0) & np.all(pvals <= 1)
+
+        rng = np.random.default_rng(0)
+        n_genes = 6
+        X = rng.poisson(lam=10, size=(60, n_genes))
+        X[:30, 2] = rng.poisson(lam=60, size=30)
+        obs = pd.DataFrame({
+            "condition": ["group"] * 30 + ["rest"] * 30,
+            "replicate": ["rep1"] * 15 + ["rep2"] * 15 + ["rep1"] * 15 + ["rep2"] * 15,
+        })
+        adata = AnnData(X=X, obs=obs)
+
+        gene_indices = np.array([0, 2, 4])
+        scores, pvals = deseq2_test(
+            adata,
+            groupby="condition",
+            group="group",
+            reference="rest",
+            replicate_col="replicate",
+            gene_indices=gene_indices,
+        )
+
+        assert scores.shape == (3,)
+        assert pvals.shape == (3,)
+        assert np.all((pvals >= 0) & (pvals <= 1))
+        # gene 2 is the planted up-regulated one and sits at position 1
+        assert scores[1] > 1.0
+        assert pvals[1] == pvals.min()
 
 
 # ---------------------------------------------------------------------------
@@ -893,7 +913,8 @@ class TestRobustnessAndEdgeCases:
             "replicate": (["rep1"] * 20 + ["rep2"] * 20) * 2,
             "batch": (["batchA"] * 10 + ["batchB"] * 10) * 4
         })
-        adata = AnnData(X=X, obs=obs)
+        var = pd.DataFrame(index=[f"gene_{i}" for i in range(n_genes)])
+        adata = AnnData(X=X, obs=obs, var=var)
 
         # 1. Run find_markers with deseq2 and replicate_col
         res = find_markers(
@@ -913,6 +934,8 @@ class TestRobustnessAndEdgeCases:
         gene0_res = res[res["gene"] == "gene_0"]
         assert len(gene0_res) == 1
         assert gene0_res["log2fc"].values[0] > 1.0
+        # scores holds DESeq2's own log2 fold change
+        assert gene0_res["scores"].values[0] > 1.0
 
         # 2. Check that it raises error if counts are not raw integers
         adata_normalized = adata.copy()

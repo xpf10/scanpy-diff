@@ -12,10 +12,12 @@ And returns:
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple
+import warnings
+from typing import List, Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from anndata import AnnData
 from scipy import sparse, stats
 from scipy.special import xlogy
 
@@ -238,29 +240,66 @@ def logistic_regression_test(
 
 
 def deseq2_test(
-    X_group: np.ndarray,
-    X_rest: np.ndarray,
+    adata: AnnData,
+    groupby: str,
+    group: str,
+    reference: str,
+    replicate_col: str,
+    covariates: Optional[List[str]] = None,
     layer: Optional[str] = None,
+    use_raw: bool = False,
+    gene_indices: Optional[np.ndarray] = None,
+    verbose: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    DESeq2-style negative binomial test using pydeseq2.
+    DESeq2 negative binomial test on pseudo-bulk samples aggregated from cells.
 
-    Note: This requires raw count data (integers). If normalized data is
-    provided, results may be unreliable.
+    Cells are summed into one pseudo-bulk sample per
+    ``(condition, replicate_col, *covariates)`` combination. Testing replicates
+    rather than cells is what makes the p-values calibrated: a per-cell
+    negative binomial fit treats cells from the same donor as independent
+    observations and massively overstates significance.
 
     Parameters
     ----------
-    X_group : np.ndarray
-        Raw count matrix for the group of interest.
-    X_rest : np.ndarray
-        Raw count matrix for the reference group.
+    adata : AnnData
+        Unsubset object; the cells to use are selected here from ``groupby``.
+    groupby : str
+        Column in ``adata.obs`` holding the group labels.
+    group : str
+        Label of the group of interest.
+    reference : str
+        Label of the reference group, or ``"rest"`` to pool every cell outside
+        ``group``.
+    replicate_col : str
+        Column in ``adata.obs`` identifying biological replicates.
+    covariates : list of str, optional
+        Extra ``adata.obs`` columns added to the design formula. They also take
+        part in the pseudo-bulk grouping, so a covariate that varies within a
+        replicate splits that replicate instead of being averaged away.
+    layer : str, optional
+        Layer holding raw counts. Defaults to ``adata.X``.
+    use_raw : bool
+        Read counts from ``adata.raw`` instead.
+    gene_indices : np.ndarray, optional
+        Positions of the genes to test; ``None`` tests every gene.
+    verbose : bool
+        Print progress.
 
     Returns
     -------
     scores : np.ndarray
-        Log2 fold changes from DESeq2.
+        Log2 fold change (group vs reference), one entry per requested gene.
     pvals : np.ndarray
-        p-values from Wald test.
+        Wald test p-value, one entry per requested gene. Genes that could not
+        be fitted (e.g. zero counts everywhere) get 0.0 and 1.0.
+
+    Notes
+    -----
+    pydeseq2's independent filtering is disabled: ``find_markers`` applies its
+    own multiple-testing correction afterwards, and independent filtering would
+    rewrite the p-values of low-mean genes to NaN (here 1.0), making that
+    correction needlessly conservative. Cooks outlier filtering is kept.
     """
     try:
         from pydeseq2.dds import DeseqDataSet
@@ -268,35 +307,160 @@ def deseq2_test(
     except ImportError:
         raise ImportError(
             "pydeseq2 is required for the 'deseq2' method. "
-            "Install it with: pip install pydeseq2"
+            "Install it with: pip install scanpy-diff[pydeseq2]"
         )
 
-    n1 = X_group.shape[0]
-    n2 = X_rest.shape[0]
-    n_genes = X_group.shape[1]
+    covariates = list(covariates) if covariates else []
+    for col in [replicate_col, *covariates]:
+        if col not in adata.obs.columns:
+            raise ValueError(
+                f"Column '{col}' not found in adata.obs. "
+                f"Available columns: {list(adata.obs.columns)}"
+            )
 
-    counts = np.vstack([X_group, X_rest]).astype(int)
-    metadata = pd.DataFrame(
-        {"condition": ["group"] * n1 + ["rest"] * n2},
-        index=[f"cell_{i}" for i in range(n1 + n2)],
+    # The factor holding group-vs-reference must not clash with a user column
+    # that is itself used as the replicate key or a covariate.
+    condition_factor = "condition"
+    while condition_factor == replicate_col or condition_factor in covariates:
+        condition_factor = "_" + condition_factor
+
+    # ------------------------------------------------------------------
+    # Select the cells belonging to the two conditions
+    # ------------------------------------------------------------------
+    labels = adata.obs[groupby].astype(str).values
+    mask_group = labels == group
+    mask_ref = ~mask_group if reference == "rest" else labels == reference
+    cell_mask = mask_group | mask_ref
+
+    if mask_group.sum() == 0:
+        raise ValueError(f"No cells found for group '{group}'.")
+    if mask_ref.sum() == 0:
+        raise ValueError(f"No cells found for reference '{reference}'.")
+
+    if use_raw:
+        if adata.raw is None:
+            raise ValueError("use_raw=True but adata.raw is None.")
+        X = adata.raw.X
+    elif layer is not None:
+        if layer not in adata.layers:
+            raise ValueError(
+                f"Layer '{layer}' not found. "
+                f"Available layers: {list(adata.layers.keys())}"
+            )
+        X = adata.layers[layer]
+    else:
+        X = adata.X
+
+    n_total_genes = X.shape[1]
+    if gene_indices is None:
+        gene_indices = np.arange(n_total_genes)
+    gene_indices = np.asarray(gene_indices)
+
+    X_sub = X[cell_mask][:, gene_indices]
+    X_sub = X_sub.tocsr() if sparse.issparse(X_sub) else sparse.csr_matrix(X_sub)
+
+    # ------------------------------------------------------------------
+    # DESeq2 models counts, so reject anything already transformed
+    # ------------------------------------------------------------------
+    data = X_sub.data
+    if data.size and (
+        not np.all(np.isfinite(data))
+        or np.any(data < 0)
+        or np.any(data % 1 != 0)
+    ):
+        raise ValueError(
+            "method='deseq2' requires raw integer counts, but the expression "
+            "matrix contains NaN, negative, or non-integer values. Pass "
+            "unnormalized counts, e.g. layer='counts' or use_raw=True."
+        )
+
+    # ------------------------------------------------------------------
+    # Aggregate cells into pseudo-bulk samples
+    # ------------------------------------------------------------------
+    condition = np.where(mask_group[cell_mask], group, reference)
+    keys = adata.obs.loc[cell_mask, [replicate_col, *covariates]].astype(str)
+    keys.insert(0, condition_factor, condition)
+    key_cols = list(keys.columns)
+
+    grouped = keys.groupby(key_cols, sort=True, observed=True)
+    sample_codes = grouped.ngroup().to_numpy()
+    sample_meta = grouped.size().rename("n_cells").reset_index()
+    sample_meta.index = [f"sample_{i}" for i in range(len(sample_meta))]
+    n_samples = len(sample_meta)
+
+    n_per_condition = sample_meta[condition_factor].value_counts()
+    for cond in (group, reference):
+        if int(n_per_condition.get(cond, 0)) < 2:
+            raise ValueError(
+                f"DESeq2 needs at least 2 pseudo-bulk samples per condition to "
+                f"estimate dispersions, but '{cond}' has "
+                f"{int(n_per_condition.get(cond, 0))}. Check that "
+                f"replicate_col='{replicate_col}' has enough distinct values."
+            )
+
+    if verbose:
+        print(
+            f"  [deseq2] {int(cell_mask.sum())} cells -> {n_samples} pseudo-bulk "
+            f"samples ({int(n_per_condition[group])} vs {int(n_per_condition[reference])})"
+        )
+
+    aggregator = sparse.csr_matrix(
+        (np.ones(int(cell_mask.sum())), (sample_codes, np.arange(int(cell_mask.sum())))),
+        shape=(n_samples, int(cell_mask.sum())),
     )
-    gene_names = [f"gene_{i}" for i in range(n_genes)]
-    counts_df = pd.DataFrame(counts, index=metadata.index, columns=gene_names)
+    bulk = np.rint((aggregator @ X_sub).toarray()).astype(np.int64)
+
+    # pydeseq2 cannot fit a gene that is zero in every sample
+    expressed = bulk.sum(axis=0) > 0
+    fitted_positions = np.where(expressed)[0]
+
+    scores = np.zeros(len(gene_indices))
+    pvals = np.ones(len(gene_indices))
+
+    if fitted_positions.size == 0:
+        warnings.warn(
+            "All requested genes have zero counts; returning log2fc=0 and pval=1.",
+            UserWarning,
+        )
+        return scores, pvals
+
+    if verbose and fitted_positions.size < len(gene_indices):
+        print(
+            f"  [deseq2] skipping {len(gene_indices) - fitted_positions.size} "
+            f"all-zero genes"
+        )
+
+    counts_df = pd.DataFrame(
+        bulk[:, fitted_positions],
+        index=sample_meta.index,
+        columns=[f"g{j}" for j in fitted_positions],
+    )
+    design_factors = [condition_factor, *covariates]
 
     dds = DeseqDataSet(
         counts=counts_df,
-        metadata=metadata,
-        design_factors="condition",
-        quiet=True,
+        metadata=sample_meta[design_factors],
+        design="~" + " + ".join(design_factors),
+        quiet=not verbose,
     )
     dds.deseq2()
 
-    stat_res = DeseqStats(dds, contrast=["condition", "group", "rest"], quiet=True)
+    stat_res = DeseqStats(
+        dds,
+        contrast=[condition_factor, group, reference],
+        cooks_filter=True,
+        independent_filter=False,
+        quiet=not verbose,
+    )
     stat_res.summary()
 
-    results = stat_res.results_df
-    scores = results["log2FoldChange"].values
-    pvals = results["pvalue"].fillna(1.0).values
+    results = stat_res.results_df.reindex(counts_df.columns)
+    scores[fitted_positions] = np.nan_to_num(
+        results["log2FoldChange"].to_numpy(dtype=float), nan=0.0
+    )
+    pvals[fitted_positions] = np.nan_to_num(
+        results["pvalue"].to_numpy(dtype=float), nan=1.0
+    )
 
     return scores, pvals
 

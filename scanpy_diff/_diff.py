@@ -140,6 +140,12 @@ def find_markers(
         )
         use_raw = False
 
+    # DESeq2 requires (and validates) raw integer counts, so log2fc has to be
+    # computed on that same scale — applying the default 'log' scale would run
+    # expm1 over counts and produce meaningless fold changes.
+    if method == "deseq2":
+        expression_scale = "raw"
+
     # Get labels as string
     labels = adata.obs[groupby].astype(str).values
 
@@ -307,7 +313,7 @@ def find_markers(
             )
 
         scores, pvals = deseq2_test(
-            X_group_or_adata=adata,
+            adata=adata,
             groupby=groupby,
             group=group_str,
             reference=ref_name,
@@ -316,6 +322,7 @@ def find_markers(
             layer=layer,
             use_raw=use_raw,
             gene_indices=gene_indices,
+            verbose=verbose,
         )
     else:
         X_group_sub = X_full[mask_group, :][:, gene_indices]
