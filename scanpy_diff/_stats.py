@@ -12,6 +12,7 @@ And returns:
 
 from __future__ import annotations
 
+import inspect
 import warnings
 from typing import List, Literal, Optional, Tuple
 
@@ -437,11 +438,19 @@ def deseq2_test(
     )
     design_factors = [condition_factor, *covariates]
 
+    # pydeseq2 0.5 replaced design_factors with a formulaic design string, but
+    # 0.4.x is the newest release installable on Python 3.9, which this package
+    # still supports.
+    if "design" in inspect.signature(DeseqDataSet).parameters:
+        design_kwargs = {"design": "~" + " + ".join(design_factors)}
+    else:
+        design_kwargs = {"design_factors": design_factors}
+
     dds = DeseqDataSet(
         counts=counts_df,
         metadata=sample_meta[design_factors],
-        design="~" + " + ".join(design_factors),
         quiet=not verbose,
+        **design_kwargs,
     )
     dds.deseq2()
 

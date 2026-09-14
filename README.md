@@ -214,7 +214,7 @@ markers = sd.find_markers(
 )
 ```
 
-- 需要安装 `pydeseq2`（>=0.5.0）：`pip install scanpy-diff[pydeseq2]`
+- 需要安装 `pydeseq2`：`pip install scanpy-diff[pydeseq2]`（0.4.x 与 0.5.x 均支持）
 - 细胞按 `(分组, replicate_col, *covariates)` 求和为伪批量样本后再检验。逐细胞拟合会把同一个体的细胞当作独立观测，导致 p 值严重失真
 - 每个分组至少需要 2 个伪批量样本，否则报错
 - 只接受原始整数计数；传入已标准化/对数化的数据会报 `ValueError`
