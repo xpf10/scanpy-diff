@@ -668,6 +668,48 @@ class TestStatFunctions:
         assert scores[1] > 1.0
         assert pvals[1] == pvals.min()
 
+    def test_mast_logistic_matches_statsmodels(self):
+        """The vectorised Newton-Raphson logistic loglik matches statsmodels GLM."""
+        pytest.importorskip("statsmodels")
+        import statsmodels.api as sm
+
+        from scanpy_diff._stats import _logistic_loglik_block
+
+        rng = np.random.default_rng(7)
+        n_cells = 200
+        condition = np.concatenate([np.ones(100), np.zeros(100)])
+        cdr = rng.normal(size=n_cells)
+        # Detection probability genuinely depends on both condition and cdr.
+        eta = -0.5 + 1.2 * condition + 0.8 * cdr
+        prob = 1.0 / (1.0 + np.exp(-eta))
+        y = (rng.random(n_cells) < prob).astype(float)
+
+        D_full = np.column_stack([np.ones(n_cells), condition, cdr])
+        D_reduced = np.column_stack([np.ones(n_cells), cdr])
+
+        ll_full = _logistic_loglik_block(y[:, None], D_full)[0]
+        ll_red = _logistic_loglik_block(y[:, None], D_reduced)[0]
+
+        glm_full = sm.GLM(y, D_full, family=sm.families.Binomial()).fit()
+        glm_red = sm.GLM(y, D_reduced, family=sm.families.Binomial()).fit()
+
+        np.testing.assert_allclose(ll_full, glm_full.llf, rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(ll_red, glm_red.llf, rtol=1e-6, atol=1e-6)
+
+    def test_mast_differs_from_bimod(self):
+        """The real MAST hurdle model is no longer an alias for bimod."""
+        from scanpy_diff._stats import bimod_test, mast_test
+
+        mast_scores, mast_pvals = mast_test(self.X_group, self.X_rest)
+        bimod_scores, _ = bimod_test(self.X_group, self.X_rest)
+
+        assert not np.allclose(mast_scores, bimod_scores), (
+            "mast and bimod should produce different statistics"
+        )
+        assert np.all(mast_pvals[:5] < 0.05), (
+            f"Expected planted markers significant, got: {mast_pvals[:5]}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for visualization functions (smoke tests)

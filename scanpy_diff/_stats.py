@@ -819,13 +819,202 @@ def negbinom_test(
 # ---------------------------------------------------------------------------
 
 
+def _residual_ss(D: np.ndarray, z: np.ndarray) -> float:
+    """Residual sum of squares of ``z`` regressed on design ``D``."""
+    coef, *_ = np.linalg.lstsq(D, z, rcond=None)
+    resid = z - D @ coef
+    return float(resid @ resid)
+
+
+def _detection_rate(X: np.ndarray | sparse.spmatrix) -> np.ndarray:
+    """Fraction of genes detected in each cell."""
+    if X.shape[1] == 0:
+        return np.zeros(X.shape[0])
+    if sparse.issparse(X):
+        detected = np.asarray((X != 0).sum(axis=1)).flatten()
+    else:
+        detected = (np.asarray(X) != 0).sum(axis=1)
+    return detected / X.shape[1]
+
+
+def _logistic_loglik_block(
+    Y: np.ndarray,
+    D: np.ndarray,
+    max_iter: int = 50,
+    tol: float = 1e-9,
+) -> np.ndarray:
+    """
+    Maximum binomial log-likelihood of every column of ``Y`` on design ``D``.
+
+    Fitted by Newton-Raphson. All response vectors share one design matrix,
+    which is what makes it worth solving them as a batch instead of looping.
+    """
+    n_genes = Y.shape[1]
+    p = D.shape[1]
+
+    ybar = np.clip(Y.mean(axis=0), 1e-6, 1.0 - 1e-6)
+    beta = np.zeros((n_genes, p))
+    beta[:, 0] = np.log(ybar / (1.0 - ybar))
+
+    ridge = np.eye(p) * 1e-8
+
+    for _ in range(max_iter):
+        eta = np.clip(D @ beta.T, -30.0, 30.0)
+        mu = 1.0 / (1.0 + np.exp(-eta))
+        w = np.maximum(mu * (1.0 - mu), 1e-10)
+
+        grad = D.T @ (Y - mu)
+        info = np.einsum("ip,ig,iq->gpq", D, w, D) + ridge
+        try:
+            delta = np.linalg.solve(info, grad.T[:, :, None])[:, :, 0]
+        except np.linalg.LinAlgError:
+            break
+
+        beta += delta
+        if np.max(np.abs(delta)) < tol:
+            break
+
+    eta = np.clip(D @ beta.T, -30.0, 30.0)
+    # log(1 + exp(eta)) evaluated so that large |eta| does not overflow
+    log_norm = np.maximum(eta, 0.0) + np.log1p(np.exp(-np.abs(eta)))
+    return np.sum(Y * eta - log_norm, axis=0)
+
+
 def mast_test(
     X_group: np.ndarray | sparse.spmatrix,
     X_rest: np.ndarray | sparse.spmatrix,
+    cdr_group: Optional[np.ndarray] = None,
+    cdr_rest: Optional[np.ndarray] = None,
     verbose: bool = False,
+    block_size: int = 500,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    MAST hurdle model test (Finak et al., 2015 / Seurat 'mast').
+    MAST two-part hurdle model test (Finak et al., 2015; Seurat ``test="MAST"``).
+
+    Each gene gets two regressions over cells that share one design matrix:
+
+    - a **discrete** logistic regression of the detection indicator ``x > 0``
+      on condition + cellular detection rate (CDR);
+    - a **continuous** Gaussian regression of expression on the same design,
+      fitted only over the cells where the gene is detected.
+
+    The two likelihood-ratio statistics are summed into a chi-square statistic.
+    Conditioning on detection is the point of the hurdle model: it separates
+    "more cells express this gene" from "expressing cells express more of it".
+    CDR is what absorbs library-level technical variation, and it is the reason
+    MAST is not interchangeable with the closed-form ``bimod`` test.
+
+    Parameters
+    ----------
+    X_group, X_rest : np.ndarray | sparse.spmatrix
+        Expression matrices (cells x genes) for the group and reference. Values
+        should be on a log scale, since the continuous component models them
+        with a Gaussian.
+    cdr_group, cdr_rest : np.ndarray, optional
+        Per-cell detection rate (fraction of genes detected) computed over the
+        **full, unfiltered** gene set. Pass these from the caller so the
+        covariate is not distorted by upstream gene pre-filtering; when omitted
+        they are computed from the matrices given here.
+    verbose : bool
+        Print progress.
+    block_size : int
+        Genes processed at a time, to bound memory.
+
+    Returns
+    -------
+    scores : np.ndarray
+        Combined chi-square likelihood-ratio statistic per gene.
+    pvals : np.ndarray
+        p-values from ``chi2`` with 2 degrees of freedom, reduced to 1 (or 0)
+        for genes where one component is degenerate.
     """
-    scores, pvals = bimod_test(X_group, X_rest, verbose=verbose)
+    n1 = X_group.shape[0]
+    n2 = X_rest.shape[0]
+    n_cells = n1 + n2
+    n_genes = X_group.shape[1]
+
+    if sparse.issparse(X_group) or sparse.issparse(X_rest):
+        X_all = sparse.vstack([X_group, X_rest]).tocsr()
+    else:
+        X_all = np.vstack([X_group, X_rest])
+
+    if cdr_group is None or cdr_rest is None:
+        cdr_group = _detection_rate(X_group)
+        cdr_rest = _detection_rate(X_rest)
+    cdr = np.concatenate([np.asarray(cdr_group, float), np.asarray(cdr_rest, float)])
+
+    # Standardising CDR cannot change any fit (it spans the same column space)
+    # but keeps the Newton step well conditioned.
+    cdr_sd = cdr.std()
+    if cdr_sd > 0:
+        cdr = (cdr - cdr.mean()) / cdr_sd
+    else:
+        cdr = np.zeros(n_cells)
+
+    condition = np.concatenate([np.ones(n1), np.zeros(n2)])
+    D_full = np.column_stack([np.ones(n_cells), condition, cdr])
+    D_reduced = np.column_stack([np.ones(n_cells), cdr])
+    p_full = D_full.shape[1]
+
+    scores = np.zeros(n_genes)
+    pvals = np.ones(n_genes)
+
+    report_step = max(1, min(n_genes // 10, 500))
+
+    for start in range(0, n_genes, block_size):
+        stop = min(start + block_size, n_genes)
+
+        block = X_all[:, start:stop]
+        if sparse.issparse(block):
+            block = block.toarray()
+        block = np.asarray(block, dtype=float)
+
+        detected = (block > 0).astype(float)
+
+        # ---- discrete component ----
+        # A gene detected in every cell or in none carries no detection signal,
+        # so the logistic part is skipped rather than fitted to a constant.
+        valid_bin = detected.sum(axis=0) > 0
+        valid_bin &= detected.sum(axis=0) < n_cells
+
+        chi2_bin = np.zeros(detected.shape[1])
+        if valid_bin.any():
+            ll_full = _logistic_loglik_block(detected[:, valid_bin], D_full)
+            ll_red = _logistic_loglik_block(detected[:, valid_bin], D_reduced)
+            chi2_bin[valid_bin] = np.maximum(0.0, 2.0 * (ll_full - ll_red))
+
+        # ---- continuous component (detected cells only) ----
+        chi2_cont = np.zeros(detected.shape[1])
+        df_cont = np.zeros(detected.shape[1], dtype=int)
+
+        for j in range(detected.shape[1]):
+            rows = detected[:, j] > 0
+            n_det = int(rows.sum())
+            if n_det <= p_full:
+                continue
+            z = block[rows, j]
+            Ds_full = D_full[rows]
+            Ds_red = D_reduced[rows]
+
+            rss_full = _residual_ss(Ds_full, z)
+            rss_red = _residual_ss(Ds_red, z)
+            if rss_full <= 0 or rss_red <= 0:
+                continue
+
+            chi2_cont[j] = max(0.0, n_det * np.log(rss_red / rss_full))
+            df_cont[j] = 1
+
+        df = valid_bin.astype(int) + df_cont
+        total = chi2_bin + chi2_cont
+
+        scores[start:stop] = total
+        ok = df > 0
+        pvals[start:stop] = np.where(
+            ok, stats.chi2.sf(total, np.where(ok, df, 1)), 1.0
+        )
+
+        if verbose and (start + 1) % report_step == 0:
+            pct = (start + 1) / n_genes * 100
+            print(f"  [mast] {start+1}/{n_genes} genes ({pct:.0f}%)")
+
     return scores, pvals

@@ -18,6 +18,7 @@ from anndata import AnnData
 from scipy import sparse
 
 from ._stats import (
+    _detection_rate,
     _to_linear_scale,
     adjust_pvalues,
     bimod_test,
@@ -199,6 +200,16 @@ def find_markers(
     )
     n_total_genes = len(gene_names)
 
+    # MAST conditions on the cellular detection rate, which has to be measured
+    # over the full gene set: the pre-filter below would otherwise shrink the
+    # cell-to-cell detection variation that the CDR covariate is there to absorb.
+    cdr_all = None
+    if method == "mast":
+        if _precomputed_stats is not None and _precomputed_stats.get("cdr") is not None:
+            cdr_all = _precomputed_stats["cdr"]
+        else:
+            cdr_all = _detection_rate(X_full)
+
     # ------------------------------------------------------------------
     # 4. Pre-filtering: pct and logFC
     # ------------------------------------------------------------------
@@ -343,7 +354,13 @@ def find_markers(
         elif method == "negbinom":
             scores, pvals = negbinom_test(X_group_sub, X_rest_sub, verbose=verbose)
         elif method == "mast":
-            scores, pvals = mast_test(X_group_sub, X_rest_sub, verbose=verbose)
+            scores, pvals = mast_test(
+                X_group_sub,
+                X_rest_sub,
+                cdr_group=cdr_all[mask_group],
+                cdr_rest=cdr_all[mask_ref],
+                verbose=verbose,
+            )
         else:
             raise ValueError(
                 f"Unknown method '{method}'. "
@@ -517,6 +534,7 @@ def find_all_markers(
             "pcts": pcts,
             "n_cells": n_cells,
             "X_full": X_full,
+            "cdr": _detection_rate(X_full) if method == "mast" else None,
         }
 
     results_list = []

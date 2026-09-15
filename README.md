@@ -1,6 +1,6 @@
 # scanpy-diff
 
-**scanpy-diff** is a scanpy plugin providing Seurat-style differential gene expression analysis (`FindMarkers` / `FindAllMarkers`). Supports Wilcoxon, t-test, logistic regression, ROC, and DESeq2 methods with multiple testing correction and visualization.
+**scanpy-diff** is a scanpy plugin providing Seurat-style differential gene expression analysis (`FindMarkers` / `FindAllMarkers`). Supports Wilcoxon, t-test, logistic regression, ROC, DESeq2, bimod, Poisson, negative binomial, and MAST methods with multiple testing correction and visualization.
 
 > 中文用户请参考下方完整文档。English API docs are in the Python docstrings.
 
@@ -20,6 +20,10 @@
 | 逻辑回归检验 | `test = "LR"` | `method = "logreg"` |
 | ROC AUC 分析 | `test = "roc"` | `method = "roc"` |
 | DESeq2 检验 | `test = "DESeq2"` | `method = "deseq2"` |
+| 双峰 LRT 检验 | `test = "bimod"` | `method = "bimod"` |
+| 泊松 GLM 检验 | `test = "poisson"` | `method = "poisson"` |
+| 负二项 GLM 检验 | `test = "negbinom"` | `method = "negbinom"` |
+| MAST 障碍模型 | `test = "MAST"` | `method = "mast"` |
 | 多重比较校正 | BH, Bonferroni | BH, Bonferroni, BY, Holm |
 | 最小表达比例过滤 | `min.pct` | `min_pct` |
 | Fold Change 过滤 | `logfc.threshold` | `logfc_threshold` |
@@ -220,6 +224,51 @@ markers = sd.find_markers(
 - 只接受原始整数计数；传入已标准化/对数化的数据会报 `ValueError`
 - `scores` 列为 DESeq2 的 log2 fold change，`log2fc` 列按原始计数尺度计算
 - 适合处理批次效应显著、且有生物学重复标注的数据
+
+### bimod（双峰 LRT）
+
+```python
+markers = sd.find_markers(adata, groupby='leiden', group='0', method='bimod')
+```
+
+- McDavid et al. (2013) 的双峰似然比检验，对应 Seurat 的 `bimod`
+- 由分组汇总统计量（检出数、细胞数、均值、方差）闭式求解，无需迭代拟合
+- 速度极快，适合全基因组规模的快速筛查
+
+### poisson（泊松 GLM）
+
+```python
+markers = sd.find_markers(adata, groupby='leiden', group='0', method='poisson')
+```
+
+- 泊松计数模型的似然比检验，对应 Seurat 的 `poisson`
+- 假设方差等于均值，适合 UMI 计数类数据
+- 闭式求解，速度快
+
+### negbinom（负二项 GLM）
+
+```python
+markers = sd.find_markers(adata, groupby='leiden', group='0', method='negbinom')
+```
+
+- 负二项计数模型的似然比检验，对应 Seurat 的 `negbinom`
+- 相比 poisson 额外引入离散度参数，能容纳过离散（方差 > 均值）
+- 离散度由矩估计得到，仍为闭式求解
+
+### MAST（障碍模型）
+
+```python
+markers = sd.find_markers(adata, groupby='leiden', group='0', method='mast')
+```
+
+- Finak et al. (2015) 的两部分障碍模型，对应 Seurat 的 `test = "MAST"`
+- **离散部分**：对检出指示变量 `x > 0` 做逻辑回归，建模"有多少细胞表达该基因"
+- **连续部分**：仅在检出的细胞上对表达量做高斯回归，建模"表达的细胞表达得多高"
+- 两部分都把 **CDR（cellular detection rate，细胞检出率）** 作为细胞级协变量纳入，用以吸收文库大小等技术噪声。CDR 在 `min_pct` / `logfc_threshold` 预过滤**之前**按全基因集计算，否则过滤后的基因子集会低估细胞间的检出率差异
+- 两个似然比统计量相加，服从自由度为 2 的卡方分布；某一部分退化（基因全检出/全不检出，或检出细胞数不足）时自动降低自由度
+- 这是 MAST 与 `bimod` 的本质区别：`bimod` 只用分组汇总统计量闭式求解，不做细胞级协变量校正
+- **速度权衡**：需要逐基因做两次回归拟合，明显慢于上述闭式检验；离散部分按基因分块向量化（Newton-Raphson 批量迭代），连续部分仍逐基因循环
+- 建议输入为对数尺度表达值（连续部分按高斯建模）
 
 ---
 
